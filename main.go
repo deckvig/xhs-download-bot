@@ -17,6 +17,8 @@ var (
 	telegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	backendURL       = os.Getenv("BACKEND_URL")
 	lastUpdateIDFile = "last_update_id.txt" // 用于存储最后一个处理的 update_id
+	// 匹配 http 或 https 开头，后面跟着非空格或非中文逗号的字符
+	urlRegex = regexp.MustCompile(`https?://[^\s，]+`)
 )
 
 // Update represents a Telegram update structure
@@ -122,7 +124,54 @@ func sendMessage(chatID int64, text string) error {
 	return nil
 }
 
+// extractUrls 从消息文本中提取所有匹配的 URL 地址
+func extractUrls(message string) []string {
+	return urlRegex.FindAllString(message, -1)
+}
+
+// download 发送单个 URL 到后端进行下载
+func download(downloadURL string) error {
+	// 注意：这里使用 downloadURL，而不是整个 message
+	payload := strings.NewReader(fmt.Sprintf(`{
+		"url": "%s",
+		"download": true
+	}`, downloadURL))
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	req, err := http.NewRequest(http.MethodPost, backendURL, payload)
+
+	if err != nil {
+		log.Printf("Error creating request for URL %s: %v", downloadURL, err)
+		return err
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	res, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error performing request for URL %s: %v", downloadURL, err)
+		return err
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Printf("Error reading response body for URL %s: %v", downloadURL, err)
+		return err
+	}
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("backend returned status code %d, body: %s", res.StatusCode, string(body))
+	}
+	
+	log.Printf("Backend response for URL %s: %s", downloadURL, string(body))
+	return nil
+}
+
 func main() {
+	if telegramBotToken == "" || backendURL == "" {
+		log.Fatal("TELEGRAM_BOT_TOKEN or BACKEND_URL environment variable is not set.")
+	}
+	
 	lastUpdateID, err := getLastUpdateID()
 	if err != nil {
 		log.Fatalf("Failed to read last update ID: %v", err)
@@ -140,17 +189,34 @@ func main() {
 		fmt.Printf("get [%d] message\n", len(updates))
 		for _, update := range updates {
 			if update.Message != nil {
-				log.Printf("Received message from chat %d: %s", update.Message.Chat.ID, update.Message.Text)
-				// 在这里处理消息
+				messageText := update.Message.Text
+				chatID := update.Message.Chat.ID
+				log.Printf("Received message from chat %d: %s", chatID, messageText)
+				
+				// 1. 提取所有 URL
+				urlsToDownload := extractUrls(messageText)
+
+				if len(urlsToDownload) == 0 {
+					log.Println("No URLs found in the message, sending notification.")
+					sendMessage(chatID, "消息中未找到任何可识别的 URL 地址，请确保链接以 http:// 或 https:// 开头。")
+				} else {
+					sendMessage(chatID, fmt.Sprintf("发现 %d 个 URL，开始按顺序下载...", len(urlsToDownload)))
+				}
+
+				// 2. 循环下载所有提取的 URL
+				for _, url := range urlsToDownload {
+					log.Printf("Attempting to download URL: %s", url)
+					
+					// 调用 download 函数，传入单个 URL
+					if err := download(url); err != nil {
+						sendMessage(chatID, fmt.Sprintf("下载失败: \nURL: %s\n错误: %v", url, err))
+					} else {
+						sendMessage(chatID, fmt.Sprintf("下载成功: \nURL: %s", url))
+					}
+				}
 			}
 
-			if err = download(update.Message.Text); err != nil {
-				sendMessage(update.Message.Chat.ID, fmt.Sprintf("下载失败, url: %s,err: %v", getUrl(update.Message.Text), err))
-			} else {
-				sendMessage(update.Message.Chat.ID, fmt.Sprintf("下载成功, url: %s", getUrl(update.Message.Text)))
-			}
-
-			// 更新最后处理的 update_id
+			// 3. 更新最后处理的 update_id
 			if update.UpdateID > lastUpdateID {
 				lastUpdateID = update.UpdateID
 			}
@@ -166,46 +232,4 @@ func main() {
 		fmt.Println("go to sleep 2s")
 		time.Sleep(2 * time.Second)
 	}
-}
-
-func download(message string) error {
-	payload := strings.NewReader(fmt.Sprintf(`{
-        "url": "%s",
- "download": true
-    }`, message))
-
-	client := &http.Client{Timeout: 10 * time.Minute}
-	req, err := http.NewRequest(http.MethodPost, backendURL, payload)
-
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-	req.Header.Add("Content-Type", "application/json")
-
-	res, err := client.Do(req)
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-	defer res.Body.Close()
-
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-	fmt.Println(string(body))
-	return nil
-}
-
-var re = regexp.MustCompile(`https?://[^\s，]+`)
-
-func getUrl(message string) string {
-	// 查找匹配的 URL
-	urls := re.FindAllString(message, -1)
-	if len(urls) == 0 {
-		return message
-	}
-	return urls[0]
 }
